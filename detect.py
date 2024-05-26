@@ -28,53 +28,45 @@ Usage - formats:
                                  yolov5s_paddle_model       # PaddlePaddle
 """
 
-import argparse
-import csv
 import os
-import platform
 import sys
 from pathlib import Path
-
 import torch
-
+import numpy as np
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-from ultralytics.utils.plotting import Annotator, colors, save_one_box
 
 from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreenshots, LoadStreams
 from utils.general import (
     LOGGER, Profile, check_img_size, colorstr, increment_path, scale_boxes, xyxy2xywh,
-    check_file,
-    check_imshow,
-    check_requirements,
-    cv2,
     non_max_suppression,
-    print_args,
-    strip_optimizer,
 )
 from utils.torch_utils import select_device, smart_inference_mode
 
 
 @smart_inference_mode()
 def run(
-        weights=ROOT / "yolov5s.pt",  # model path or triton URL
-        source=ROOT / "data/images",  # file/dir/URL/glob/screen/0(webcam)
-        data=ROOT / "data/coco128.yaml",  # dataset.yaml path
+        weights=ROOT / "runs/train/epoch=60bs=8/weights/best.pt",  # ROOT / "yolov5s.pt"
+        source=ROOT / "data/from_Airsim/photos_1715246442",  # file/dir/URL/glob/screen/0(webcam)
+        data=ROOT / "data/VisDrone.yaml",  # dataset.yaml path
+        conf_thres=0.25,  # confidence threshold
+        iou_thres=0.45,  # NMS IOU threshold
+        max_det=1000,  # maximum detections per image
         imgsz=(640, 640),  # inference size (height, width)
         device="",  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        save_txt=False,  # save results to *.txt
+        save_txt=True,  # save results to *.txt
         save_conf=False,  # save confidences in --save-txt labels
-        nosave=False,  # do not save images/videos
+        nosave=True,  # 不保存检测结果
         classes=None,  # filter by class: --class 0, or --class 0 2 3
-        augment=False,  # augmented inference
-        project=ROOT / "runs/detect",  # save results to project/name
-        name="exp",  # save results to project/name
-        exist_ok=False,  # existing project/name ok, do not increment
+        agnostic_nms=False,
+        project=ROOT / "runs/detect",  # 保存结果的项目文件夹路径
+        name="result_airsim",  # save results to project/name
+        exist_ok=False,  # 如果结果文件夹已存在，是否覆盖
 
 ):
     source = str(source)
@@ -113,21 +105,25 @@ def run(
                 ims = torch.chunk(im, im.shape[0], 0)
         # 检测
         with dt[1]:
-            visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
+
             if model.xml and im.shape[0] > 1:  # 如果是xml，且输入图像数量大于1
                 pred = None
                 for image in ims:
                     if pred is None:
-                        pred = model(image, augment=augment, visualize=visualize).unsqueeze(0)
+                        pred = model(image).unsqueeze(0)
                     else:
-                        pred = torch.cat((pred, model(image, augment=augment, visualize=visualize).unsqueeze(0)), dim=0)
+                        pred = torch.cat((pred, model(image).unsqueeze(0)), dim=0)
                 pred = [pred, None]
-            else:
-                pred = model(im, augment=augment, visualize=visualize)
+            else:  # TODO：这里好像只执行了else，所以上面的可以删
+                pred = model(im) # 调试得im(1*3*640*640) im0s(1280*1280*3)
+        # print(len(pred), pred[0].shape) # 2 torch.Size([1, 25200, 15])
+        with dt[2]:
+            pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
+        # print(len(pred), pred[0].shape) # 1 torch.Size([8, 6])
+        # 可见non_max_suppression将pred进行了筛选，删除重叠的部分。
 
-        # Process predictions
         # 遍历每个预测结果。pred是模型的预测结果，i是当前预测结果的索引，det是当前预测结果。
-        for i, det in enumerate(pred):  # per image
+        for i, det in enumerate(pred):  # pred包含了很多图片各自的det，是list
             seen += 1
             p, im0, frame = path, im0s.copy(), getattr(dataset, "frame", 0)
 
@@ -137,14 +133,15 @@ def run(
             s += "%gx%g " % im.shape[2:]  # 将图像的高度和宽度添加到日志字符串s中
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # 将预测边界框从模型输入大小转回原始图像大小，但这个在保存txt时需要
 
-            if len(det):
-                # 将预测的边界框从模型输入大小转换回原始图像大小。
+            if len(det):  # 如果检测结果不为0
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
 
-                # Print results 遍历结果中的每个类别，并打印每个类别的检测数量
+                # 遍历det中所有预测结果的类别ID（不重复）
+                # det正常应该是对象数*6，比如5*6 8*6。6中前4个为坐标，然后是置信度和类别
                 for c in det[:, 5].unique():
-                    n = (det[:, 5] == c).sum()  # detections per class
-                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
+                    n = (det[:, 5] == c).sum()
+                    #print(c, n)
+                    s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # 输出例如3 dogs ， 1 dog 的信息
 
                 # Write results 遍历每个预测结果，将其写入txt文件。
                 for *xyxy, conf, cls in reversed(det):
@@ -154,7 +151,7 @@ def run(
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
-        # Print time (inference-only) 记录日志
+        # Print time (inference-only) 记录信息
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
 
     # Print results 记录一些关于模型性能信息和结果保存的信息，也会显示在控制台上
